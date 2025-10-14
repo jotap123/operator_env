@@ -1,9 +1,12 @@
+boto3
+s3fs
 paeio
 transformers
 torch
 langsmith
 langgraph
 langchain
+langchain_openai
 langchain_chroma
 langchain-community
 langchain-huggingface

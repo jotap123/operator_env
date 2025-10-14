@@ -1,6 +1,6 @@
 from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
 from langchain_openai import ChatOpenAI
-from src.config import power_chat
+from operator.config import power_chat
 
 
 def load_llm_chat(model, temperature=0.1, max_new_tokens=1024):
