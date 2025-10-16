@@ -12,5 +12,6 @@ langchain-community
 langchain-huggingface
 langchainhub
 faiss-cpu
+sentence-transformers
 streamlit
 -e .
