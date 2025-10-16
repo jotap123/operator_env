@@ -6,14 +6,18 @@ from langchain_core.messages import HumanMessage, AIMessage
 
 
 def call_model(version: str, messages: str):
+    """
+    Synchronously call Bedrock runtime with a concatenated prompt built from LangChain messages.
+    Returns the assistant text output.
+    """
     runtime = boto3.client('bedrock-runtime', region_name='us-east-2')
     
     models = {
-        "lightweight": "anthropic.claude-sonnet-4-5-20250929-v1:0",
-        "medium": "anthropic.claude-sonnet-4-5-20250929-v1:0",
-        "heavy": "anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "lightweight": "qwen.qwen3-32b-v1:0",
+        "medium": "meta.llama3-1-70b-instruct-v1:0",
+        "heavy": "qwen.qwen3-235b-a22b-2507-v1:0",
     }
-    model_id = models.get(version, "anthropic.claude-sonnet-4-5-20250929-v1:0")
+    model_id = models.get(version, "meta.llama3-1-70b-instruct-v1:0")
 
     bedrock_messages = []
     for msg in messages:
@@ -29,31 +33,32 @@ def call_model(version: str, messages: str):
             })
 
     native_request = {
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 1024,
+        "prompt": bedrock_messages,
+        "max_gen_len": 1024,
         "temperature": 0.1,
-        "messages": [
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": bedrock_messages}],
-            }
-        ],
+        "top_p": 0.5
     }
 
-    request = json.dumps(native_request)
+    request_body = json.dumps(native_request)
 
     try:
         # Invoke the model with the request.
-        response = runtime.invoke_model(modelId=model_id, body=request)
+        response = runtime.invoke_model(modelId=model_id, body=request_body)
 
     except (ClientError, Exception) as e:
-        print(f"ERROR: Can't invoke '{model_id}'. Reason: {e}")
-        exit(1)
+        # Keep behavior visible to caller
+        raise RuntimeError(f"ERROR: Can't invoke '{model_id}'. Reason: {e}")
 
-    # Decode the response body.
-    model_response = json.loads(response["body"].read())
+    # Decode the response body
+    try:
+        model_response = json.loads(response["body"].read())
+    except Exception:
+        # Fallback if body is already a string
+        try:
+            model_response = json.loads(response["body"])
+        except Exception:
+            model_response = response
 
-    # Extract and print the response text.
-    response_text = model_response["content"][0]["text"]
-    
-    return response_text
+    assistant_response = model_response["generation"].strip()
+
+    return assistant_response

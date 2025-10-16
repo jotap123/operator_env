@@ -19,11 +19,11 @@ from operator.config import settings
 from operator.llm.state import Action, State
 from operator.llm.model_calling import call_model
 from operator.llm.prompts import (
-    ACTION_DETERMINER_PROMPT,
-    QUERY_CURATOR_PROMPT,
-    QUERY_EXPANDER_PROMPT,
-    RAG_PROMPT,
-    DIRECT_RESPONSE_PROMPT
+    build_action_messages,
+    build_query_curator_messages,
+    build_query_expander_messages,
+    build_rag_messages,
+    build_direct_response_messages,
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -42,13 +42,10 @@ class LLMAgent:
 
     async def _determine_action(self, state: State) -> State:
         """Determines whether to search or respond directly."""
-        chain = ACTION_DETERMINER_PROMPT | self.llm | StrOutputParser()
-        
         try:
-            result = await chain.ainvoke({
-                "messages": state["messages"],
-                "summary": state.get("summary", "No history yet.")
-            })
+            messages = build_action_messages(state)
+            # run the blocking call_model in a thread
+            result = await asyncio.to_thread(call_model, messages)
             action = result.strip().upper()
             if "SEARCH" in action:
                 state["action_plan"] = "SEARCH"
@@ -67,14 +64,14 @@ class LLMAgent:
         """Optimizes and expands the user's query for better retrieval."""
         original_query = state['messages'][-1].content
         
-        # Curate query
-        curate_chain = QUERY_CURATOR_PROMPT | self.llm | StrOutputParser()
-        curated_query = await curate_chain.ainvoke({"query": original_query})
+        # Curate query via call_model
+        curated_msgs = build_query_curator_messages(original_query)
+        curated_query = await asyncio.to_thread(call_model, curated_msgs)
         state["curated_query"] = curated_query.strip()
 
         # Expand query
-        expand_chain = QUERY_EXPANDER_PROMPT | self.llm | StrOutputParser()
-        expanded_result = await expand_chain.ainvoke({"query": curated_query})
+        expand_msgs = build_query_expander_messages(state["curated_query"])
+        expanded_result = await asyncio.to_thread(call_model, expand_msgs)
         expanded_queries = [q.strip() for q in expanded_result.split('\n') if q.strip()]
         state["expanded_queries"] = [curated_query] + expanded_queries
         
@@ -146,19 +143,12 @@ class LLMAgent:
     async def _generate_response(self, state: State) -> State:
         """Generates a final response based on the action plan and context."""
         if state['action_plan'] == "SEARCH":
-            prompt = RAG_PROMPT
-            inputs = {
-                "context": state["context"],
-                "summary": state.get("summary", "No history yet."),
-                "messages": state['messages']
-            }
-        else: # "NONE" action
-            prompt = DIRECT_RESPONSE_PROMPT
-            inputs = {"messages": state['messages']}
-        
-        chain = prompt | self.llm | StrOutputParser()
-        response = await chain.ainvoke(inputs)
-        state["messages"].append(AIMessage(content=response))
+            messages = build_rag_messages(state.get("context", ""), state.get("summary", "No history yet."), state['messages'])
+        else:  # "NONE" action
+            messages = build_direct_response_messages(state['messages'])
+
+        response_text = await asyncio.to_thread(call_model, messages)
+        state["messages"].append(AIMessage(content=response_text))
         return state
 
 
@@ -186,13 +176,14 @@ class LLMAgent:
                 key topics, facts, and important context:"""
 
             messages_for_summary = recent_messages + [HumanMessage(content=summary_prompt)]
-            response = self.llm.invoke(messages_for_summary)
+            # synchronous call to call_model (this method is sync)
+            response_text = call_model(messages_for_summary)
             
             # Keep only the most recent messages plus the summary
             delete_messages = [RemoveMessage(id=m.id) for m in state["messages"][:-4]]
             
             return {
-                "summary": response.content, 
+                "summary": response_text, 
                 "messages": delete_messages
             }
             
@@ -246,3 +237,4 @@ class LLMAgent:
         except Exception as e:
             logging.error(f"Error processing query for thread {thread_id}: {e}")
             return "I'm sorry, an unexpected error occurred. Please try again."
+        
