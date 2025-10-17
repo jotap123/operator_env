@@ -5,7 +5,6 @@ from typing import Dict, Any, Optional
 
 from langchain_chroma import Chroma
 from langgraph.checkpoint.memory import MemorySaver
-from langchain_core.output_parsers import StrOutputParser
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.retrievers.document_compressors import CrossEncoderReranker
 from langchain_core.messages import HumanMessage, AIMessage, RemoveMessage
@@ -15,15 +14,15 @@ from langchain.retrievers import BM25Retriever, EnsembleRetriever
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.graph import StateGraph, END
 
-from operator.config import settings
-from operator.llm.state import Action, State
-from operator.llm.model_calling import call_model
-from operator.llm.prompts import (
-    build_action_messages,
-    build_query_curator_messages,
-    build_query_expander_messages,
-    build_rag_messages,
-    build_direct_response_messages,
+from operador.config import settings
+from operador.llm.state import Action, State
+from operador.llm.model_calling import call_model
+from operador.llm.prompts import (
+    ROUTER_PROMPT,
+    QUERY_CURATOR_PROMPT,
+    QUERY_EXPANDER_PROMPT,
+    RETRIEVAL_PROMPT,
+    DIRECT_RESPONSE_PROMPT,
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -43,9 +42,13 @@ class LLMAgent:
     async def _determine_action(self, state: State) -> State:
         """Determines whether to search or respond directly."""
         try:
-            messages = build_action_messages(state)
             # run the blocking call_model in a thread
-            result = await asyncio.to_thread(call_model, messages)
+            result = await asyncio.to_thread(
+                call_model,
+                version="lightweight",
+                system_prompt=ROUTER_PROMPT.format(summary=state.get("summary", "No history yet.")),
+                messages=state['messages'],
+            )
             action = result.strip().upper()
             if "SEARCH" in action:
                 state["action_plan"] = "SEARCH"
@@ -63,18 +66,25 @@ class LLMAgent:
     async def _curate_and_expand_query(self, state: State) -> State:
         """Optimizes and expands the user's query for better retrieval."""
         original_query = state['messages'][-1].content
-        
-        # Curate query via call_model
-        curated_msgs = build_query_curator_messages(original_query)
-        curated_query = await asyncio.to_thread(call_model, curated_msgs)
+
+        curated_query = await asyncio.to_thread(
+            call_model,
+            version="lightweight",
+            system_prompt=QUERY_CURATOR_PROMPT.format(query=original_query),
+            messages=state['messages']
+        )
         state["curated_query"] = curated_query.strip()
 
         # Expand query
-        expand_msgs = build_query_expander_messages(state["curated_query"])
-        expanded_result = await asyncio.to_thread(call_model, expand_msgs)
+        expanded_result = await asyncio.to_thread(
+            call_model,
+            version="lightweight",
+            system_prompt=QUERY_EXPANDER_PROMPT.format(query=state["curated_query"]),
+            messages=state['messages']
+        )
         expanded_queries = [q.strip() for q in expanded_result.split('\n') if q.strip()]
         state["expanded_queries"] = [curated_query] + expanded_queries
-        
+
         return state
 
 
@@ -82,23 +92,23 @@ class LLMAgent:
         """Loads a PDF, splits it into chunks, and sets up the hybrid retriever."""
         try:
             loader = PyPDFLoader(pdf_path)
-            docs = await loader.aload() # Async loading
-            
+            docs = await loader.aload()
+
             splitter = RecursiveCharacterTextSplitter(
                 chunk_size=settings.CHUNK_SIZE,
                 chunk_overlap=settings.CHUNK_OVERLAP
             )
             chunks = splitter.split_documents(docs)
-            
+
             self.vectorstore = Chroma.from_documents(chunks, self.embeddings)
-            
+
             bm25_retriever = BM25Retriever.from_documents(chunks)
             bm25_retriever.k = settings.BM25_K
-            
+
             vector_retriever = self.vectorstore.as_retriever(
                 search_kwargs={"k": settings.VECTOR_K}
             )
-            
+
             self.ensemble_retriever = EnsembleRetriever(
                 retrievers=[bm25_retriever, vector_retriever],
                 weights=settings.ENSEMBLE_WEIGHTS
@@ -123,7 +133,7 @@ class LLMAgent:
 
             # Deduplicate documents based on content
             unique_docs = {doc.page_content: doc for doc in all_docs}.values()
-            
+
             # Rerank the unique documents
             reranked_docs = await self.reranker.acompress_documents(
                 documents=unique_docs,
@@ -143,11 +153,19 @@ class LLMAgent:
     async def _generate_response(self, state: State) -> State:
         """Generates a final response based on the action plan and context."""
         if state['action_plan'] == "SEARCH":
-            messages = build_rag_messages(state.get("context", ""), state.get("summary", "No history yet."), state['messages'])
+            PROMPT = RETRIEVAL_PROMPT.format(
+                context=state.get("context", "No context available."),
+                summary=state.get("summary", "No history yet.")
+            )
         else:  # "NONE" action
-            messages = build_direct_response_messages(state['messages'])
+            PROMPT = DIRECT_RESPONSE_PROMPT
 
-        response_text = await asyncio.to_thread(call_model, messages)
+        response_text = await asyncio.to_thread(
+            call_model,
+            version="medium",
+            system_prompt=PROMPT,
+            messages=state['messages']
+        )
         state["messages"].append(AIMessage(content=response_text))
         return state
 
@@ -237,4 +255,3 @@ class LLMAgent:
         except Exception as e:
             logging.error(f"Error processing query for thread {thread_id}: {e}")
             return "I'm sorry, an unexpected error occurred. Please try again."
-        
