@@ -4,7 +4,9 @@ import asyncio
 from typing import Dict, Any, Optional
 
 from langchain_chroma import Chroma
+from langchain.chat_models import init_chat_model
 from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.output_parsers import StrOutputParser
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.retrievers.document_compressors import CrossEncoderReranker
 from langchain_core.messages import HumanMessage, AIMessage, RemoveMessage
@@ -15,9 +17,8 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.graph import StateGraph, END
 
 from operador.config import settings
-from operador.llm.state import Action, State
-from operador.llm.model_calling import call_model
-from operador.llm.prompts import (
+from operador.base_llm.state import Action, State
+from operador.base_llm.prompts import (
     ROUTER_PROMPT,
     QUERY_CURATOR_PROMPT,
     QUERY_EXPANDER_PROMPT,
@@ -30,6 +31,14 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 class LLMAgent:
     def __init__(self):
+        self.llm = init_chat_model(
+            model_name=settings.LLM_MODEL_NAME,
+            model_provider=settings.LLM_PROVIDER,
+            region_name=settings.LLM_REGION_NAME,
+            temperature=settings.LLM_TEMPERATURE,
+            max_tokens=settings.LLM_MAX_TOKENS,
+            streaming=False,
+        )
         self.embeddings = None
         self.search_tool = TavilySearchResults(max_results=settings.MAX_SEARCH_RESULTS)
         self.vectorstore: Optional[Chroma] = None
@@ -41,14 +50,12 @@ class LLMAgent:
 
     async def _determine_action(self, state: State) -> State:
         """Determines whether to search or respond directly."""
+        chain = ROUTER_PROMPT | self.llm | StrOutputParser()
         try:
-            # run the blocking call_model in a thread
-            result = await asyncio.to_thread(
-                call_model,
-                version="lightweight",
-                system_prompt=ROUTER_PROMPT.format(summary=state.get("summary", "No history yet.")),
-                messages=state['messages'],
-            )
+            result = await chain.ainvoke({
+                "messages": state["messages"],
+                "summary": state.get("summary", "No history yet.")
+            })
             action = result.strip().upper()
             if "SEARCH" in action:
                 state["action_plan"] = "SEARCH"
@@ -67,24 +74,17 @@ class LLMAgent:
         """Optimizes and expands the user's query for better retrieval."""
         original_query = state['messages'][-1].content
 
-        curated_query = await asyncio.to_thread(
-            call_model,
-            version="lightweight",
-            system_prompt=QUERY_CURATOR_PROMPT.format(query=original_query),
-            messages=state['messages']
-        )
+        # Curate query
+        curate_chain = QUERY_CURATOR_PROMPT | self.llm | StrOutputParser()
+        curated_query = await curate_chain.ainvoke({"query": original_query})
         state["curated_query"] = curated_query.strip()
 
         # Expand query
-        expanded_result = await asyncio.to_thread(
-            call_model,
-            version="lightweight",
-            system_prompt=QUERY_EXPANDER_PROMPT.format(query=state["curated_query"]),
-            messages=state['messages']
-        )
+        expand_chain = QUERY_EXPANDER_PROMPT | self.llm | StrOutputParser()
+        expanded_result = await expand_chain.ainvoke({"query": curated_query})
         expanded_queries = [q.strip() for q in expanded_result.split('\n') if q.strip()]
         state["expanded_queries"] = [curated_query] + expanded_queries
-
+        
         return state
 
 
@@ -153,20 +153,19 @@ class LLMAgent:
     async def _generate_response(self, state: State) -> State:
         """Generates a final response based on the action plan and context."""
         if state['action_plan'] == "SEARCH":
-            PROMPT = RETRIEVAL_PROMPT.format(
-                context=state.get("context", "No context available."),
-                summary=state.get("summary", "No history yet.")
-            )
-        else:  # "NONE" action
-            PROMPT = DIRECT_RESPONSE_PROMPT
-
-        response_text = await asyncio.to_thread(
-            call_model,
-            version="medium",
-            system_prompt=PROMPT,
-            messages=state['messages']
-        )
-        state["messages"].append(AIMessage(content=response_text))
+            prompt = RETRIEVAL_PROMPT
+            inputs = {
+                "context": state["context"],
+                "summary": state.get("summary", "No history yet."),
+                "messages": state['messages']
+            }
+        else: # "NONE" action
+            prompt = DIRECT_RESPONSE_PROMPT
+            inputs = {"messages": state['messages']}
+        
+        chain = prompt | self.llm | StrOutputParser()
+        response = await chain.ainvoke(inputs)
+        state["messages"].append(AIMessage(content=response))
         return state
 
 
@@ -195,13 +194,13 @@ class LLMAgent:
 
             messages_for_summary = recent_messages + [HumanMessage(content=summary_prompt)]
             # synchronous call to call_model (this method is sync)
-            response_text = call_model(messages_for_summary)
+            response = self.llm.invoke(messages_for_summary)
             
             # Keep only the most recent messages plus the summary
             delete_messages = [RemoveMessage(id=m.id) for m in state["messages"][:-4]]
             
             return {
-                "summary": response_text, 
+                "summary": response.content.strip(), 
                 "messages": delete_messages
             }
 
